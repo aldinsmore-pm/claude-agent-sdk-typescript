@@ -88,6 +88,78 @@ app.get("/api/file", async (req, res) => {
   }
 });
 
+app.post("/api/file", async (req, res) => {
+  try {
+    const relative = String(req.body?.path ?? "").trim();
+    if (!relative) {
+      res.status(400).json({ error: "Path is required." });
+      return;
+    }
+    const resolved = ensureDocsPath(relative);
+    const content = String(req.body?.content ?? "");
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
+    await fs.writeFile(resolved, content, "utf8");
+    res.json({ path: relative });
+  } catch (error) {
+    res.status(400).json({ error: "Failed to create file." });
+  }
+});
+
+app.patch("/api/file", async (req, res) => {
+  try {
+    const relative = String(req.body?.path ?? "").trim();
+    const nextPath = String(req.body?.newPath ?? "").trim();
+    if (!relative || !nextPath) {
+      res.status(400).json({ error: "Path and newPath are required." });
+      return;
+    }
+    const resolved = ensureDocsPath(relative);
+    const resolvedNext = ensureDocsPath(nextPath);
+    await fs.mkdir(path.dirname(resolvedNext), { recursive: true });
+    await fs.rename(resolved, resolvedNext);
+    res.json({ path: nextPath });
+  } catch (error) {
+    res.status(400).json({ error: "Failed to rename file." });
+  }
+});
+
+app.delete("/api/file", async (req, res) => {
+  try {
+    const relative = String(req.query.path ?? "");
+    const resolved = ensureDocsPath(relative);
+    await fs.rm(resolved);
+    res.json({ path: relative });
+  } catch (error) {
+    res.status(400).json({ error: "Failed to delete file." });
+  }
+});
+
+app.get("/api/search", async (req, res) => {
+  try {
+    const query = String(req.query.query ?? "").trim().toLowerCase();
+    if (!query) {
+      res.json({ results: [] });
+      return;
+    }
+    const files = await listMarkdownFiles(docsRoot, docsRoot);
+    const results = [];
+    for (const file of files) {
+      const resolved = ensureDocsPath(file);
+      const content = await fs.readFile(resolved, "utf8");
+      const index = content.toLowerCase().indexOf(query);
+      if (index >= 0) {
+        const start = Math.max(0, index - 60);
+        const end = Math.min(content.length, index + 60);
+        const snippet = content.slice(start, end).replace(/\s+/g, " ").trim();
+        results.push({ path: file, snippet });
+      }
+    }
+    res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: "Search failed." });
+  }
+});
+
 app.post("/api/run", async (req, res) => {
   const prompt = String(req.body?.prompt ?? "").trim();
   if (!prompt) {
@@ -104,16 +176,26 @@ app.post("/api/run", async (req, res) => {
   };
   runs.set(runId, run);
 
-  emitRunEvent(run, { event: "started", data: { message: "Run started" } });
-  emitRunEvent(run, { event: "progress", data: { message: "Agent running" } });
+  emitRunEvent(run, { event: "started", data: { message: "Started" } });
 
   void (async () => {
     try {
-      const result = await runAgent({ prompt, workspaceRoot });
+      const result = await runAgent({
+        prompt,
+        workspaceRoot,
+        onStatus: (message) => emitRunEvent(run, { event: "progress", data: { message } })
+      });
       run.status = "done";
       emitRunEvent(run, {
         event: "done",
-        data: { message: "Run completed", outputPath: result.outputPath }
+        data: {
+          message: "Done",
+          outputPath: result.outputPath,
+          relativePath: result.relativePath,
+          previousContent: result.previousContent,
+          content: result.content,
+          sources: result.sources
+        }
       });
     } catch (error) {
       run.status = "error";
