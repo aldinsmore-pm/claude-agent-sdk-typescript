@@ -5,17 +5,55 @@ import ReactMarkdown from "react-markdown";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
 
+const MAX_STEPS = 8;
+const MAX_OUTPUTS = 6;
+
 type RunLog = {
   event: string;
   message: string;
 };
 
-type RunResult = {
+type PlanAgent = {
+  name: string;
+  role: string;
+};
+
+type PlanStep = {
+  id: string;
+  title: string;
+  description: string;
+  agent: string;
+};
+
+type RunPlan = {
+  interpretedGoal: string;
+  steps: PlanStep[];
+  agents: PlanAgent[];
+  outputs: string[];
+  questions: string[];
+};
+
+type ArtifactResult = {
   outputPath: string;
   relativePath: string;
   previousContent: string;
   content: string;
+};
+
+type StepResult = {
+  stepId: string;
+  title: string;
+  agent: string;
+  output: string;
+};
+
+type RunResult = {
+  artifacts: ArtifactResult[];
+  steps: StepResult[];
   sources: string[];
+  outputs: string[];
+  mainArtifact: string;
+  plan: RunPlan;
 };
 
 type SearchResult = {
@@ -23,13 +61,17 @@ type SearchResult = {
   snippet: string;
 };
 
-const TIMELINE_STEPS = [
-  "Started",
-  "Reading workspace documents",
-  "Drafting brief",
-  "Writing document",
-  "Done"
-];
+type PlanResponse = {
+  plan: RunPlan;
+};
+
+type RunEventPayload = {
+  stepId?: string;
+  title?: string;
+  agent?: string;
+  path?: string;
+  message?: string;
+};
 
 const fetchJson = async <T,>(url: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(url, options);
@@ -41,11 +83,13 @@ const fetchJson = async <T,>(url: string, options?: RequestInit): Promise<T> => 
 
 const formatDocTitle = (file: string) => {
   const clean = file.replace(/\.md$/i, "");
-  return clean
-    .split("/")
-    .pop()
-    ?.replace(/[-_]/g, " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase()) ?? file;
+  return (
+    clean
+      .split("/")
+      .pop()
+      ?.replace(/[-_]/g, " ")
+      .replace(/\b\w/g, (match) => match.toUpperCase()) ?? file
+  );
 };
 
 const normalizeDocName = (value: string) => {
@@ -83,43 +127,58 @@ const HomePage = () => {
   const [files, setFiles] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [content, setContent] = useState<string>("");
-  const [prompt, setPrompt] = useState<string>("Summarize these notes into a brief.");
-  const [refinement, setRefinement] = useState<string>("");
+  const [prompt, setPrompt] = useState<string>(
+    "Draft a customer brief based on the workspace documents."
+  );
+  const [planStatus, setPlanStatus] = useState<string>("Idle");
+  const [planError, setPlanError] = useState<string>("");
+  const [plan, setPlan] = useState<RunPlan | null>(null);
+  const [clarifications, setClarifications] = useState<string>("");
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [runStatus, setRunStatus] = useState<string>("Idle");
-  const [timelineIndex, setTimelineIndex] = useState<number>(-1);
-  const [lastRun, setLastRun] = useState<RunResult | null>(null);
+  const [runResult, setRunResult] = useState<RunResult | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [refinePrompt, setRefinePrompt] = useState<string>("");
+  const [rerunStep, setRerunStep] = useState<string>("");
 
   const selectedLabel = useMemo(() => selectedFile ?? "No document selected", [selectedFile]);
 
-  const timeline = useMemo(
-    () =>
-      TIMELINE_STEPS.map((step, index) => ({
-        step,
-        status: index < timelineIndex ? "done" : index === timelineIndex ? "active" : "pending"
-      })),
-    [timelineIndex]
-  );
+  const planSteps = plan?.steps ?? [];
+  const planOutputs = plan?.outputs ?? [];
+  const planAgents = plan?.agents ?? [];
 
-  const diffLines = useMemo(() => {
-    if (!lastRun) {
+  const stepStatus = useMemo(() => {
+    const status = new Map<string, "pending" | "active" | "done">();
+    planSteps.forEach((step) => status.set(step.id, "pending"));
+    logs.forEach((log) => {
+      if (log.event === "step_started" && log.message) {
+        const stepId = log.message.split("|")[0];
+        if (stepId) {
+          status.set(stepId, "active");
+        }
+      }
+      if (log.event === "step_completed" && log.message) {
+        const stepId = log.message.split("|")[0];
+        if (stepId) {
+          status.set(stepId, "done");
+        }
+      }
+    });
+    return status;
+  }, [logs, planSteps]);
+
+  const artifactsWithDiff = useMemo(() => {
+    if (!runResult) {
       return [];
     }
-    return getDiffLines(lastRun.previousContent ?? "", lastRun.content ?? "");
-  }, [lastRun]);
-
-  const updateTimeline = useCallback((message: string) => {
-    const normalized = message.toLowerCase();
-    const nextIndex = TIMELINE_STEPS.findIndex((step) =>
-      normalized.includes(step.toLowerCase())
-    );
-    if (nextIndex >= 0) {
-      setTimelineIndex(nextIndex);
-    }
-  }, []);
+    return runResult.artifacts.map((artifact) => ({
+      ...artifact,
+      diff: getDiffLines(artifact.previousContent ?? "", artifact.content ?? "")
+    }));
+  }, [runResult]);
 
   const loadFiles = useCallback(() => {
     fetchJson<{ files: string[] }>(`${API_BASE_URL}/api/files`)
@@ -170,51 +229,130 @@ const HomePage = () => {
     return () => clearTimeout(handle);
   }, [searchQuery]);
 
-  const runAgent = async (mode: "run" | "improve") => {
+  const generatePlan = async () => {
+    try {
+      setPlanStatus("Planning...");
+      setPlanError("");
+      const data = await fetchJson<PlanResponse>(`${API_BASE_URL}/api/plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt })
+      });
+      setPlan(data.plan);
+      setClarifications("");
+      setPlanStatus("Plan ready");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to plan";
+      setPlanStatus("Plan failed");
+      setPlanError(message);
+    }
+  };
+
+  const runPlan = async (options?: { mode?: "refine"; startingStepIndex?: number }) => {
+    if (!plan) {
+      return;
+    }
+    if (plan.questions.length > 0 && !clarifications.trim()) {
+      setPlanError("Please answer the clarifying questions before running.");
+      return;
+    }
+
+    const runPrompt =
+      options?.mode === "refine" && refinePrompt.trim()
+        ? refinePrompt.trim()
+        : prompt;
+
     try {
       setLogs([]);
-      setTimelineIndex(-1);
-      setLastRun(null);
+      setRunResult(null);
       setIsRunning(true);
       setRunStatus("Starting...");
-      const fullPrompt =
-        mode === "improve" && refinement.trim()
-          ? `${prompt}\n\nImprove the brief using this feedback: ${refinement.trim()}`
-          : prompt;
+      setPlanError("");
+
       const { runId } = await fetchJson<{ runId: string }>(`${API_BASE_URL}/api/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: fullPrompt })
+        body: JSON.stringify({
+          prompt: runPrompt,
+          plan,
+          clarifications: clarifications.trim(),
+          startingStepIndex: options?.startingStepIndex ?? 0,
+          priorArtifacts:
+            options?.mode === "refine"
+              ? runResult?.artifacts.map((artifact) => ({
+                  path: artifact.relativePath,
+                  content: artifact.content
+                }))
+              : []
+        })
       });
 
+      setActiveRunId(runId);
       const eventSource = new EventSource(`${API_BASE_URL}/api/run/${runId}/events`);
+
+      const handleLog = (event: string, message: string) => {
+        setLogs((prev) => [...prev, { event, message }]);
+      };
+
       eventSource.addEventListener("started", (event) => {
-        const data = JSON.parse((event as MessageEvent).data) as { message: string };
-        setRunStatus(data.message);
-        updateTimeline(data.message);
-        setLogs((prev) => [...prev, { event: "started", message: data.message }]);
+        const data = JSON.parse((event as MessageEvent).data) as RunEventPayload;
+        setRunStatus(data.message ?? "Started");
+        handleLog("started", data.message ?? "Started");
       });
 
-      eventSource.addEventListener("progress", (event) => {
-        const data = JSON.parse((event as MessageEvent).data) as { message: string };
-        setRunStatus(data.message);
-        updateTimeline(data.message);
-        setLogs((prev) => [...prev, { event: "progress", message: data.message }]);
+      eventSource.addEventListener("planning", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as RunEventPayload;
+        setRunStatus(data.message ?? "Planning");
+        handleLog("planning", data.message ?? "Planning");
+      });
+
+      eventSource.addEventListener("step_started", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as RunEventPayload;
+        const logMessage = `${data.stepId ?? ""}|${data.agent ?? ""}|${data.title ?? ""}`;
+        setRunStatus(`${data.agent ?? "Agent"} working on ${data.title ?? "step"}`);
+        handleLog("step_started", logMessage);
+      });
+
+      eventSource.addEventListener("step_completed", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as RunEventPayload;
+        const logMessage = `${data.stepId ?? ""}|${data.agent ?? ""}|${data.title ?? ""}`;
+        handleLog("step_completed", logMessage);
+      });
+
+      eventSource.addEventListener("artifact_written", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as RunEventPayload;
+        const message = data.path ? `Wrote ${data.path}` : "Wrote artifact";
+        setRunStatus(message);
+        handleLog("artifact_written", message);
       });
 
       eventSource.addEventListener("done", (event) => {
         const data = JSON.parse((event as MessageEvent).data) as RunResult & { message: string };
-        setRunStatus(data.message);
-        updateTimeline(data.message);
-        setLogs((prev) => [...prev, { event: "done", message: data.message }]);
+        setRunStatus(data.message ?? "Done");
+        handleLog("done", data.message ?? "Done");
         eventSource.close();
-        setLastRun(data);
-        if (data.relativePath) {
-          setSelectedFile(data.relativePath);
-          setContent(data.content);
+        setRunResult(data);
+        setIsRunning(false);
+        setActiveRunId(null);
+        if (data.mainArtifact) {
+          setSelectedFile(data.mainArtifact);
+          const mainArtifact = data.artifacts.find(
+            (artifact) => artifact.relativePath === data.mainArtifact
+          );
+          if (mainArtifact) {
+            setContent(mainArtifact.content);
+          }
         }
         loadFiles();
+      });
+
+      eventSource.addEventListener("cancelled", (event) => {
+        const data = JSON.parse((event as MessageEvent).data) as RunEventPayload;
+        setRunStatus(data.message ?? "Cancelled");
+        handleLog("cancelled", data.message ?? "Cancelled");
+        eventSource.close();
         setIsRunning(false);
+        setActiveRunId(null);
       });
 
       eventSource.addEventListener("error", (event) => {
@@ -230,15 +368,17 @@ const HomePage = () => {
           }
         }
         setRunStatus("Error");
-        setLogs((prev) => [...prev, { event: "error", message }]);
+        handleLog("error", message);
         eventSource.close();
         setIsRunning(false);
+        setActiveRunId(null);
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to run";
       setLogs((prev) => [...prev, { event: "error", message }]);
       setRunStatus("Error");
       setIsRunning(false);
+      setActiveRunId(null);
     }
   };
 
@@ -306,6 +446,84 @@ const HomePage = () => {
     }
   };
 
+  const handleCancelRun = async () => {
+    if (!activeRunId) {
+      return;
+    }
+    try {
+      await fetchJson(`${API_BASE_URL}/api/run/${activeRunId}/cancel`, { method: "POST" });
+      setRunStatus("Cancelling...");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to cancel";
+      setLogs((prev) => [...prev, { event: "error", message }]);
+    }
+  };
+
+  const handlePlanStepChange = (index: number, field: keyof PlanStep, value: string) => {
+    setPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      const steps = [...prev.steps];
+      steps[index] = { ...steps[index], [field]: value };
+      return { ...prev, steps };
+    });
+  };
+
+  const handleAddStep = () => {
+    setPlan((prev) => {
+      if (!prev || prev.steps.length >= MAX_STEPS) {
+        return prev;
+      }
+      const nextStep: PlanStep = {
+        id: `step-${prev.steps.length + 1}`,
+        title: "New step",
+        description: "Describe what should happen.",
+        agent: prev.agents[0]?.name ?? "Writer"
+      };
+      return { ...prev, steps: [...prev.steps, nextStep] };
+    });
+  };
+
+  const handleRemoveStep = (index: number) => {
+    setPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      const steps = prev.steps.filter((_, idx) => idx !== index);
+      return { ...prev, steps };
+    });
+  };
+
+  const handleOutputChange = (index: number, value: string) => {
+    setPlan((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      const outputs = [...prev.outputs];
+      outputs[index] = normalizeDocName(value);
+      return { ...prev, outputs };
+    });
+  };
+
+  const handleAddOutput = () => {
+    setPlan((prev) => {
+      if (!prev || prev.outputs.length >= MAX_OUTPUTS) {
+        return prev;
+      }
+      return { ...prev, outputs: [...prev.outputs, "New Doc.md"] };
+    });
+  };
+
+  const handleForkPlan = () => {
+    if (!runResult?.plan) {
+      return;
+    }
+    setPlan(runResult.plan);
+    setPlanStatus("Plan ready (forked)");
+    setPlanError("");
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -371,11 +589,11 @@ const HomePage = () => {
         <section className="panel hero-panel">
           <div className="hero-header">
             <div>
-              <p className="eyebrow">Ask / Generate</p>
-              <h1>Create a brief from your workspace</h1>
+              <p className="eyebrow">Run builder</p>
+              <h1>Plan before you execute</h1>
               <p className="subtext">
-                Drop notes in the notebook, ask for a work product, and we will save it as a
-                document.
+                Draft a plan, review each step, and then run a multi-agent workflow that
+                generates bundled artifacts.
               </p>
             </div>
             <div className="doc-actions">
@@ -401,41 +619,152 @@ const HomePage = () => {
           <div className="toolbar">
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
             <div className="toolbar-actions">
-              <button type="button" onClick={() => runAgent("run")} disabled={isRunning}>
-                Generate Brief
+              <button type="button" onClick={generatePlan} disabled={isRunning}>
+                Generate Plan
               </button>
               <button
                 type="button"
                 className="secondary-button"
-                onClick={() => runAgent("run")}
-                disabled={isRunning}
+                onClick={() => runPlan()}
+                disabled={!plan || isRunning}
               >
-                Re-run
+                Run Plan
               </button>
-            </div>
-          </div>
-          <div className="refinement">
-            <label htmlFor="refinement">Improve output</label>
-            <div className="refinement-row">
-              <input
-                id="refinement"
-                value={refinement}
-                onChange={(event) => setRefinement(event.target.value)}
-                placeholder="Optional feedback (e.g., make it shorter, add risks)"
-              />
               <button
                 type="button"
-                className="secondary-button"
-                onClick={() => runAgent("improve")}
-                disabled={isRunning}
+                className="secondary-button danger"
+                onClick={handleCancelRun}
+                disabled={!activeRunId || !isRunning}
               >
-                Improve
+                Cancel Run
               </button>
             </div>
           </div>
           <div className="status-row">
-            <span className="status-pill">{runStatus}</span>
+            <span className="status-pill">{planStatus}</span>
+            {planError ? <span className="status-error">{planError}</span> : null}
           </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h3>Plan preview</h3>
+            <span className="panel-meta">Review and edit before running</span>
+          </div>
+          {plan ? (
+            <div className="plan-preview">
+              <div className="plan-summary">
+                <div>
+                  <p className="panel-meta">Interpreted goal</p>
+                  <h4>{plan.interpretedGoal}</h4>
+                </div>
+                <div>
+                  <p className="panel-meta">Sub-agents</p>
+                  <ul className="pill-list">
+                    {planAgents.map((agent) => (
+                      <li key={agent.name}>
+                        <strong>{agent.name}</strong>
+                        <span>{agent.role}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="plan-grid">
+                <div>
+                  <p className="panel-meta">Steps (editable)</p>
+                  <ol className="step-list">
+                    {planSteps.map((step, index) => (
+                      <li key={step.id} className={`step-item ${stepStatus.get(step.id)}`}>
+                        <div className="step-header">
+                          <input
+                            value={step.title}
+                            onChange={(event) =>
+                              handlePlanStepChange(index, "title", event.target.value)
+                            }
+                          />
+                          <select
+                            value={step.agent}
+                            onChange={(event) =>
+                              handlePlanStepChange(index, "agent", event.target.value)
+                            }
+                          >
+                            {planAgents.map((agent) => (
+                              <option key={agent.name} value={agent.name}>
+                                {agent.name}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => handleRemoveStep(index)}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                        <textarea
+                          value={step.description}
+                          onChange={(event) =>
+                            handlePlanStepChange(index, "description", event.target.value)
+                          }
+                        />
+                      </li>
+                    ))}
+                  </ol>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={handleAddStep}
+                    disabled={planSteps.length >= MAX_STEPS}
+                  >
+                    Add step
+                  </button>
+                </div>
+
+                <div>
+                  <p className="panel-meta">Planned outputs</p>
+                  <ul className="output-list">
+                    {planOutputs.map((output, index) => (
+                      <li key={`${output}-${index}`}>
+                        <input
+                          value={output}
+                          onChange={(event) => handleOutputChange(index, event.target.value)}
+                        />
+                      </li>
+                    ))}
+                  </ul>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={handleAddOutput}
+                    disabled={planOutputs.length >= MAX_OUTPUTS}
+                  >
+                    Add output
+                  </button>
+
+                  {plan.questions.length > 0 && (
+                    <div className="clarifications">
+                      <p className="panel-meta">Clarifying questions</p>
+                      <ul>
+                        {plan.questions.map((question) => (
+                          <li key={question}>{question}</li>
+                        ))}
+                      </ul>
+                      <textarea
+                        placeholder="Answer the questions so we can continue."
+                        value={clarifications}
+                        onChange={(event) => setClarifications(event.target.value)}
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p>Generate a plan to see the steps and outputs.</p>
+          )}
         </section>
 
         <section className="panel">
@@ -452,21 +781,27 @@ const HomePage = () => {
           <div>
             <div className="panel-header">
               <h3>Run timeline</h3>
-              <span className="panel-meta">What the agent is doing</span>
+              <span className="panel-meta">Live status and step progress</span>
             </div>
-            <ol className="timeline">
-              {timeline.map((item) => (
-                <li key={item.step} className={`timeline-item ${item.status}`}>
+            <ul className="timeline">
+              <li className="timeline-item active">
+                <span className="timeline-dot" />
+                <span>{runStatus}</span>
+              </li>
+              {planSteps.map((step) => (
+                <li key={step.id} className={`timeline-item ${stepStatus.get(step.id)}`}>
                   <span className="timeline-dot" />
-                  <span>{item.step}</span>
+                  <span>
+                    {step.title} <em>{step.agent}</em>
+                  </span>
                 </li>
               ))}
-            </ol>
-            {lastRun?.sources?.length ? (
+            </ul>
+            {runResult?.sources?.length ? (
               <div className="sources">
                 <p className="panel-meta">Sources provided</p>
                 <ul>
-                  {lastRun.sources.map((source) => (
+                  {runResult.sources.map((source) => (
                     <li key={source}>{source}</li>
                   ))}
                 </ul>
@@ -476,27 +811,117 @@ const HomePage = () => {
 
           <div>
             <div className="panel-header">
-              <h3>What changed</h3>
-              <span className="panel-meta">Diff from last output</span>
+              <h3>Artifacts bundle</h3>
+              <span className="panel-meta">Saved outputs from this run</span>
             </div>
-            {lastRun ? (
-              <div className="diff">
-                {diffLines.length === 0 ? (
-                  <p>No line changes detected.</p>
-                ) : (
-                  <ul>
-                    {diffLines.map((line, index) => (
-                      <li key={`${line.type}-${index}`} className={`diff-${line.type}`}>
-                        <span>{line.type === "added" ? "+" : "-"}</span>
-                        <code>{line.text}</code>
-                      </li>
-                    ))}
-                  </ul>
-                )}
+            {runResult ? (
+              <div className="artifact-list">
+                {runResult.artifacts.map((artifact) => (
+                  <button
+                    key={artifact.relativePath}
+                    type="button"
+                    onClick={() => {
+                      setSelectedFile(artifact.relativePath);
+                      setContent(artifact.content);
+                    }}
+                  >
+                    <strong>{formatDocTitle(artifact.relativePath)}</strong>
+                    <span>{artifact.relativePath}</span>
+                  </button>
+                ))}
               </div>
             ) : (
-              <p>Run the agent to see changes.</p>
+              <p>Run the plan to generate artifacts.</p>
             )}
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h3>What changed</h3>
+            <span className="panel-meta">Diffs for updated documents</span>
+          </div>
+          {runResult ? (
+            <div className="diff-grid">
+              {artifactsWithDiff.map((artifact) => (
+                <div key={artifact.relativePath} className="diff-card">
+                  <h4>{artifact.relativePath}</h4>
+                  {artifact.diff.length === 0 ? (
+                    <p>No line changes detected.</p>
+                  ) : (
+                    <ul className="diff">
+                      {artifact.diff.map((line, index) => (
+                        <li key={`${line.type}-${index}`} className={`diff-${line.type}`}>
+                          <span>{line.type === "added" ? "+" : "-"}</span>
+                          <code>{line.text}</code>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p>Run the plan to see diffs.</p>
+          )}
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h3>Refine this run</h3>
+            <span className="panel-meta">Iterate without starting over</span>
+          </div>
+          <div className="refinement">
+            <label htmlFor="refinement">Refinement prompt</label>
+            <div className="refinement-row">
+              <input
+                id="refinement"
+                value={refinePrompt}
+                onChange={(event) => setRefinePrompt(event.target.value)}
+                placeholder="Ask for changes (e.g., add risks, shorten summary)"
+              />
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => runPlan({ mode: "refine" })}
+                disabled={isRunning || !runResult}
+              >
+                Refine outputs
+              </button>
+            </div>
+          </div>
+          <div className="refinement">
+            <label htmlFor="rerun-step">Re-run from step</label>
+            <div className="refinement-row">
+              <select
+                id="rerun-step"
+                value={rerunStep}
+                onChange={(event) => setRerunStep(event.target.value)}
+              >
+                <option value="">Select a step</option>
+                {planSteps.map((step, index) => (
+                  <option key={step.id} value={String(index)}>
+                    {step.title}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => runPlan({ startingStepIndex: Number(rerunStep || 0) })}
+                disabled={isRunning || !plan || rerunStep === ""}
+              >
+                Re-run step
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={handleForkPlan}
+                disabled={!runResult}
+              >
+                Fork run
+              </button>
+            </div>
           </div>
         </section>
 

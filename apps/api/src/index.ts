@@ -4,20 +4,34 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { runAgent } from "@mvp/worker";
+import {
+  createPlan,
+  runAgent,
+  type RunPlan,
+  type ArtifactResult,
+  type PlanAgentRole
+} from "@mvp/worker";
 
 const app = express();
 const port = Number.parseInt(process.env.API_PORT ?? "4000", 10);
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const workspaceRoot = path.join(repoRoot, "workspace");
 const docsRoot = path.join(workspaceRoot, "docs");
 
 type RunEvent = {
-  event: "started" | "progress" | "done" | "error";
+  event:
+    | "started"
+    | "planning"
+    | "step_started"
+    | "step_completed"
+    | "artifact_written"
+    | "done"
+    | "error"
+    | "cancelled";
   data: Record<string, unknown>;
 };
 
@@ -25,7 +39,8 @@ type RunState = {
   id: string;
   events: RunEvent[];
   listeners: Set<(event: RunEvent) => void>;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
+  cancelled: boolean;
 };
 
 const runs = new Map<string, RunState>();
@@ -66,6 +81,28 @@ const emitRunEvent = (run: RunState, event: RunEvent) => {
     listener(event);
   }
 };
+
+const normalizePlanInput = (plan: RunPlan) => ({
+  interpretedGoal: String(plan.interpretedGoal ?? ""),
+  steps: Array.isArray(plan.steps)
+    ? plan.steps.map((step) => ({
+        id: String(step.id ?? ""),
+        title: String(step.title ?? ""),
+        description: String(step.description ?? ""),
+        agent: String(step.agent ?? "")
+      }))
+    : [],
+  agents: Array.isArray(plan.agents)
+    ? plan.agents.map((agent) => ({
+        name: String(agent.name ?? ""),
+        role: String(agent.role ?? "Writer") as PlanAgentRole
+      }))
+    : [],
+  outputs: Array.isArray(plan.outputs) ? plan.outputs.map((output) => String(output)) : [],
+  questions: Array.isArray(plan.questions)
+    ? plan.questions.map((question) => String(question)).filter(Boolean)
+    : []
+});
 
 app.get("/api/files", async (_req, res) => {
   try {
@@ -160,44 +197,112 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
-app.post("/api/run", async (req, res) => {
+app.post("/api/plan", async (req, res) => {
   const prompt = String(req.body?.prompt ?? "").trim();
   if (!prompt) {
     res.status(400).json({ error: "Prompt is required." });
     return;
   }
 
+  try {
+    const plan = await createPlan({
+      prompt,
+      workspaceRoot,
+      onStatus: () => undefined
+    });
+    res.json({ plan });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to create plan." });
+  }
+});
+
+app.post("/api/run", async (req, res) => {
+  const prompt = String(req.body?.prompt ?? "").trim();
+  const planInput = req.body?.plan as RunPlan | undefined;
+  if (!prompt || !planInput) {
+    res.status(400).json({ error: "Prompt and plan are required." });
+    return;
+  }
+
+  const plan = normalizePlanInput(planInput);
+  const clarifications = String(req.body?.clarifications ?? "").trim();
+  if (plan.questions.length > 0 && !clarifications) {
+    res.status(400).json({ error: "Clarifications required before running the plan." });
+    return;
+  }
+
+  const startingStepIndex = Number.parseInt(req.body?.startingStepIndex ?? "0", 10);
+  const priorArtifacts = Array.isArray(req.body?.priorArtifacts)
+    ? (req.body?.priorArtifacts as { path: string; content: string }[]).map((artifact) => ({
+        path: String(artifact.path ?? ""),
+        content: String(artifact.content ?? "")
+      }))
+    : [];
+
   const runId = randomUUID();
   const run: RunState = {
     id: runId,
     events: [],
     listeners: new Set(),
-    status: "running"
+    status: "running",
+    cancelled: false
   };
   runs.set(runId, run);
 
-  emitRunEvent(run, { event: "started", data: { message: "Started" } });
+  emitRunEvent(run, { event: "started", data: { message: "Started", runId } });
 
   void (async () => {
     try {
+      emitRunEvent(run, { event: "planning", data: { message: "Planning" } });
+
       const result = await runAgent({
         prompt,
+        plan,
         workspaceRoot,
-        onStatus: (message) => emitRunEvent(run, { event: "progress", data: { message } })
+        clarifications,
+        priorArtifacts,
+        startingStepIndex: Number.isNaN(startingStepIndex) ? 0 : startingStepIndex,
+        shouldCancel: () => run.cancelled,
+        onStatus: (message) => emitRunEvent(run, { event: "planning", data: { message } }),
+        onStepStart: (step) =>
+          emitRunEvent(run, {
+            event: "step_started",
+            data: { stepId: step.id, title: step.title, agent: step.agent }
+          }),
+        onStepComplete: (stepResult) =>
+          emitRunEvent(run, {
+            event: "step_completed",
+            data: { stepId: stepResult.stepId, title: stepResult.title, agent: stepResult.agent }
+          }),
+        onArtifactWritten: (artifact: ArtifactResult) =>
+          emitRunEvent(run, {
+            event: "artifact_written",
+            data: { path: artifact.relativePath }
+          })
       });
+
       run.status = "done";
       emitRunEvent(run, {
         event: "done",
         data: {
           message: "Done",
-          outputPath: result.outputPath,
-          relativePath: result.relativePath,
-          previousContent: result.previousContent,
-          content: result.content,
-          sources: result.sources
+          artifacts: result.artifacts,
+          steps: result.steps,
+          sources: result.sources,
+          outputs: result.outputs,
+          mainArtifact: result.mainArtifact,
+          plan: result.plan
         }
       });
     } catch (error) {
+      if (run.cancelled) {
+        run.status = "cancelled";
+        emitRunEvent(run, {
+          event: "cancelled",
+          data: { message: "Cancelled" }
+        });
+        return;
+      }
       run.status = "error";
       emitRunEvent(run, {
         event: "error",
@@ -209,6 +314,16 @@ app.post("/api/run", async (req, res) => {
   })();
 
   res.json({ runId });
+});
+
+app.post("/api/run/:id/cancel", (req, res) => {
+  const run = runs.get(req.params.id);
+  if (!run) {
+    res.status(404).json({ error: "Run not found." });
+    return;
+  }
+  run.cancelled = true;
+  res.json({ status: "cancelling" });
 });
 
 app.get("/api/run/:id/events", (req, res) => {
