@@ -6,7 +6,7 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "concurrently -k -n web,api -c blue,green \"pnpm --filter @mvp/web dev\" \"pnpm --filter @mvp/api dev\"",
+    "dev": "pnpm --filter @mvp/worker build && concurrently -k -n web,api -c blue,green \"pnpm --filter @mvp/web dev\" \"pnpm --filter @mvp/api dev\"",
     "build": "pnpm -r build",
     "smoke": "node scripts/agent_smoke_test.mjs",
     "check-env": "node scripts/check_env.mjs"
