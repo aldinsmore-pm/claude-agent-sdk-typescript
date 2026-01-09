@@ -1,0 +1,20 @@
+{
+  "name": "claude-agent-sdk-mvp",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n web,api -c blue,green \"pnpm --filter @mvp/web dev\" \"pnpm --filter @mvp/api dev\"",
+    "build": "pnpm -r build",
+    "smoke": "node scripts/agent_smoke_test.mjs",
+    "check-env": "node scripts/check_env.mjs"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.2",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
